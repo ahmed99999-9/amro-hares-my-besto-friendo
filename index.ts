@@ -41,16 +41,17 @@ type Upstream = {
 };
 
 const CONFIG = {
-	rotateSeconds: 180,
-	connectTimeoutMs: 6000,
-	healthTimeoutMs: 8000,
-	healthConcurrency: 40,
-	healthCheckLimit: 250,
+	rotateSeconds: 60,
+	connectTimeoutMs: 4000,
+	healthTimeoutMs: 4000,
+	healthConcurrency: 50,
+	healthCheckLimit: 400,
+	perSourceLimit: 10,
 	minWorking: 6,
-	failoverCacheSize: 10,
+	failoverCacheSize: 25,
 	failoverTries: 4,
 	failoverThreshold: 2,
-	heartbeatSeconds: 10,
+	heartbeatSeconds: 5,
 	outageRetrySeconds: 3,
 	freeListUrls: [
 		"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text&protocol=http",
@@ -477,21 +478,22 @@ async function fetchFreeList(): Promise<Upstream[]> {
 				const text = await res.text();
 				let n = 0;
 				for (const line of text.split(/\r?\n/)) {
+					if (n >= CONFIG.perSourceLimit) break;
 					const m = line.trim().match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/);
 					if (!m) continue;
 					const key = m[1] + ":" + m[2];
 					if (seen.has(key)) continue;
 					seen.add(key);
-					out.push({ type, host: m[1], port: parseInt(m[2], 10), source: "free" });
+					out.push({ type, host: m[1], port: parseInt(m[2], 10), source: url });
 					n++;
 				}
-				log(`[pool] source OK (${type}): ${url} - ${n} new proxies`);
+				log(`[pool] source OK (${type}): ${url} - ${n} proxies (cap ${CONFIG.perSourceLimit}/source)`);
 			} catch (e) {
 				log(`[pool] source failed: ${url} (${(e as Error).message})`);
 			}
 		}),
 	);
-	log(`[pool] merged free pool: ${out.length} unique proxies from ${CONFIG.freeListUrls.length} sources`);
+	log(`[pool] merged pool: ${out.length} unique proxies (<=${CONFIG.perSourceLimit} per source)`);
 	return out;
 }
 
@@ -692,6 +694,13 @@ function connectWithFailover(state: State, host: string, port: number): Promise<
 async function heartbeat(state: State): Promise<void> {
 	const up = state.active;
 	if (!up || state.rotating || state.outage) return;
+	// Proactively refresh when the clean pool is running low, so a burst of
+	// usage can never exhaust it into a frozen (all-burned) state.
+	if (state.workingCache.length < 4) {
+		log(`[heartbeat] pool low (${state.workingCache.length}) - proactive rotate`);
+		rotate(state, false).catch((e) => log(`[heartbeat] rotation error: ${(e as Error).message}`));
+		return;
+	}
 	// The free Zen rate limit is BY EXIT IP: an active IP can get burned
 	// mid-session. Re-probe it against opencode-zen; prune + rotate on burn.
 	const zen = await zenProbe(up, 5000).catch(() => "dead" as const);
@@ -867,9 +876,10 @@ async function startProxy(singleton: Singleton): Promise<number> {
 		}
 	});
 
+	const fixedPort = process.env.OMP_ZEN_VPN_PORT ? parseInt(process.env.OMP_ZEN_VPN_PORT, 10) : 0;
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
-		server.listen(0, "127.0.0.1", () => resolve());
+		server.listen(fixedPort, "127.0.0.1", () => resolve());
 	});
 	const addr = server.address();
 	const port = typeof addr === "object" && addr ? addr.port : 0;
