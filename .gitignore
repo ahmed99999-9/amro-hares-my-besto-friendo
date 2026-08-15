@@ -1,6 +1,0 @@
-# runtime state - never commit
-status.json
-proxy.log
-proxy.log.old
-last-run.txt
-watchdog.lock
